@@ -1,0 +1,157 @@
+# =============================================================================
+#  .github/workflows/ci-cd.yml - Đề 007
+#  Mật khẩu MySQL và thông tin SSH được lấy từ GitHub Actions Secrets.
+#  - job build : kiểm tra student.env -> build & chạy thử -> smoke test -> push image GHCR
+#  - job deploy: SSH vào server -> cập nhật mã nguồn -> pull image -> khởi động lại
+# =============================================================================
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Tạo cấu hình triển khai từ Secrets
+        env:
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
+        run: |
+          set -eu
+          if [ -z "$MYSQL_PASSWORD" ] || [ -z "$MYSQL_ROOT_PASSWORD" ]; then
+            echo "::error::Thiếu GitHub Secrets MYSQL_PASSWORD hoặc MYSQL_ROOT_PASSWORD"
+            exit 1
+          fi
+          cp student.env.example student.env
+          printf 'MYSQL_PASSWORD=%s\nMYSQL_ROOT_PASSWORD=%s\n' \
+            "$MYSQL_PASSWORD" "$MYSQL_ROOT_PASSWORD" >> student.env
+          chmod 600 student.env
+
+      - name: Kiểm tra thông tin trong student.env
+        run: |
+          set -a; source student.env; set +a
+          for v in STUDENT_NAME STUDENT_ID STUDENT_CLASS STUDENT_EMAIL GITHUB_USERNAME \
+                   APP_PORT COMPOSE_PROJECT_NAME MYSQL_USER MYSQL_PASSWORD MYSQL_ROOT_PASSWORD; do
+            if [ -z "${!v}" ]; then
+              echo "::error file=student.env::Chưa điền $v trong student.env"
+              exit 1
+            fi
+          done
+          if [ "$EXAM_CODE" != "007" ] || [ "$MYSQL_DATABASE" != "ptit_lab_db" ]; then
+            echo "::error file=student.env::EXAM_CODE hoặc MYSQL_DATABASE không đúng Đề 007"
+            exit 1
+          fi
+          if [ "$APP_PORT" -lt 8080 ]; then
+            echo "::error file=student.env::APP_PORT phải từ 8080 trở lên"
+            exit 1
+          fi
+          echo "### Sinh viên: $STUDENT_NAME - $STUDENT_ID - $STUDENT_CLASS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Đặt tên image
+        id: meta
+        run: echo "image=${REGISTRY}/${GITHUB_REPOSITORY,,}/app" >> "$GITHUB_OUTPUT"
+
+      - name: Build & chạy thử bằng Docker Compose
+        env:
+          APP_IMAGE: ${{ steps.meta.outputs.image }}
+          APP_TAG: ${{ github.sha }}
+          APP_VERSION: ${{ github.sha }}
+        run: docker compose --env-file student.env up -d --build --wait --wait-timeout 300
+
+      - name: Smoke test
+        run: |
+          set -a; source student.env; set +a
+          BASE="http://localhost:${APP_PORT}"
+          # Kiểm tra endpoint $BASE/api/tickets trả về JSON (CÓ SẴN, lỗi -> pipeline FAIL)
+          curl -fsS --retry 12 --retry-delay 5 --retry-all-errors "$BASE/api/tickets" | grep -q '"id"'
+          echo "Smoke test OK"
+
+      - name: In log khi lỗi
+        if: failure()
+        run: docker compose --env-file student.env logs --no-color
+
+      - name: Đăng nhập GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cài QEMU và Buildx để build thêm image arm64 cho server
+        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Push image lên GHCR
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --build-arg APP_VERSION=${{ github.sha }} \
+            -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" --push .
+
+      - name: Dọn dẹp
+        if: always()
+        run: docker compose --env-file student.env down -v
+
+  deploy:
+    name: Deploy lên server
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Deploy qua SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          APP_IMAGE: ${{ needs.build.outputs.image }}
+          APP_TAG: ${{ github.sha }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          DEPLOY_DIR: ${{ github.event.repository.name }}
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || '22' }}
+          envs: APP_IMAGE,APP_TAG,GHCR_USER,GHCR_TOKEN,REPO_URL,DEPLOY_DIR,MYSQL_PASSWORD,MYSQL_ROOT_PASSWORD
+          script: |
+            set -e
+            if [ ! -d "$HOME/$DEPLOY_DIR/.git" ]; then
+              git clone "$REPO_URL" "$HOME/$DEPLOY_DIR"
+            fi
+            cd "$HOME/$DEPLOY_DIR"
+            git fetch origin main
+            git reset --hard origin/main
+            if [ -z "$MYSQL_PASSWORD" ] || [ -z "$MYSQL_ROOT_PASSWORD" ]; then
+              echo "Thiếu mật khẩu MySQL trong GitHub Secrets"
+              exit 1
+            fi
+            cp student.env.example student.env
+            printf 'MYSQL_PASSWORD=%s\nMYSQL_ROOT_PASSWORD=%s\n' \
+              "$MYSQL_PASSWORD" "$MYSQL_ROOT_PASSWORD" >> student.env
+            chmod 600 student.env
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+            export APP_IMAGE APP_TAG
+            docker compose --env-file student.env pull app
+            docker compose --env-file student.env up -d --no-build --wait --wait-timeout 300
+            docker logout ghcr.io
+            docker compose --env-file student.env ps
