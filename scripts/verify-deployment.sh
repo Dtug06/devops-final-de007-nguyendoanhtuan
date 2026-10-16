@@ -8,7 +8,7 @@ if [ -f student.env ]; then
   set +a
 fi
 
-APP_PORT="${APP_PORT:-8091}"
+APP_PORT="${APP_PORT:-8092}"
 
 echo "=== Tai khoan va nhom ==="
 whoami
@@ -21,4 +21,3 @@ docker compose --env-file student.env ps
 echo "=== API De 007 ==="
 curl -fsS "http://localhost:${APP_PORT}/api/tickets"
 echo
-
